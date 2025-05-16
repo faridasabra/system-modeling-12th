@@ -128,7 +128,6 @@ def visualize_summary(rides, sim_time, completed_visitors, total_visitors):
 
     throughput_percent = (completed_visitors / total_visitors) * 100
 
-    # Soft pastel theme
     pastel_pink = "#ffb6c1"
     pastel_purple = "#dda0dd"
     pastel_peach = "#ffe4e1"
