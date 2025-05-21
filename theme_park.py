@@ -7,8 +7,8 @@ import seaborn as sns
 from tabulate import tabulate
 from collections import defaultdict
 
-SIMULATION_TIME = 10 * 60
-VISITOR_ARRIVAL_MEAN = 0.5
+SIMULATION_TIME = 10 * 60 # total sim time in minutes
+VISITOR_ARRIVAL_MEAN = 0.5 # avg time bw visitor arrival
 RIDE_NAMES = ["Carousel", "Slide Cars", "Race Cars", "Ferris Wheel",
               "Self-Control Planes", "Spiral Rides", "Flying Tower"]
 RIDE_CAPACITY = {
@@ -44,7 +44,7 @@ VISITOR_PRIORITY = {
     "regular": 1,
 }
 
-event_logs_per_ride = {name: [] for name in RIDE_NAMES}
+event_logs_per_ride = {name: [] for name in RIDE_NAMES} # init list for each ride
 
 def format_time(t):
     total_seconds = int(t * 60)
@@ -58,13 +58,12 @@ class Ride:
         self.env = env
         self.name = name
         self.capacity = capacity
-        self.resource = simpy.PriorityResource(env, capacity)
+        self.resource = simpy.PriorityResource(env, capacity) # simpy resource w priority
         self.broken = False
         self.total_visitors = 0
         self.dropped_visitors = 0
         self.total_wait_time = 0
         self.utilization_time = 0
-        self.total_queue_time = 0
         self.queue_lengths = []
         self.failures = 0
         self.completed_rides = 0
@@ -74,26 +73,27 @@ class Ride:
         self.queue_log = []
         self.idle_time = 0
         self.last_busy_time = 0
-        self.env.process(self.breakdown_monitor())
-        self.env.process(self.log_time_series())
+        self.env.process(self.breakdown_monitor()) # start breakdown monitoring
+        self.env.process(self.log_time_series()) # start time series logging
 
     def monitor_utilization(self):
         now = self.env.now # gets current sim time
         duration = now - self.last_event_time # calc how much time passed since last state change
         state = 'broken' if self.broken else ('busy' if self.resource.count else 'idle')
-        self.state_durations[state] += duration
+        self.state_durations[state] += duration # add to state duration
         if state == 'idle':
-            self.idle_time += duration
+            self.idle_time += duration # track idle time
         elif state == 'broken':
-            self.last_busy_time = now
-        self.last_event_time = now
+            self.last_busy_time = now # track last busy time
+        self.last_event_time = now # track last event time
 
-    def log_event(self, visitor_id, arrival_time, wait_time, service_time, ride_start_time, ride_end_time, visitor_type):
+    def log_event(self, visitor_id, arrival_time, wait_time, service_time, ride_start_time, ride_end_time, visitor_type, priority):
         if len(event_logs_per_ride[self.name]) < 20:
             event_logs_per_ride[self.name].append([
                 format_time(self.env.now),
-                visitor_type,
                 visitor_id,
+                visitor_type,
+                priority,
                 self.name,
                 format_time(arrival_time),
                 f"{service_time} min",
@@ -105,18 +105,18 @@ class Ride:
                 "broken" if self.broken else "busy" if self.resource.count else "idle"
             ])
 
-    def breakdown_monitor(self):
+    def breakdown_monitor(self): # sim random breakdowns
         while True:
-            if not self.broken and random.random() < RIDE_FAILURE_PROB[self.name]:
-                self.broken = True
+            if not self.broken and random.random() < RIDE_FAILURE_PROB[self.name]: # chance of breakdown
+                self.broken = True # mark as broken
                 self.failures += 1
-                self.monitor_utilization()
-                yield self.env.timeout(RIDE_REPAIR_TIME())
-                self.monitor_utilization()
-                self.broken = False
-            yield self.env.timeout(1)
+                self.monitor_utilization() # log state change
+                yield self.env.timeout(RIDE_REPAIR_TIME()) # sim repair time
+                self.monitor_utilization() # log repair finished
+                self.broken = False # ride is fixed
+            yield self.env.timeout(1) # check again in one minute
 
-    def log_time_series(self):
+    def log_time_series(self): # log util and queue length every 5 mins
         while True:
             self.utilization_log.append((self.env.now, self.resource.count))
             self.queue_log.append((self.env.now, len(self.resource.queue)))
@@ -125,26 +125,27 @@ class Ride:
 def visitor_generator(env, rides, arrival_mean):
     visitor_id = 0
     while True:
-        yield env.timeout(np.random.exponential(arrival_mean))
-        visitor_type = random.choices(["child", "adult"], weights=[0.5, 0.5])[0]
+        yield env.timeout(np.random.exponential(arrival_mean)) # wait for next visitor
+        visitor_type = random.choices(["child", "adult"], weights=[0.5, 0.5])[0] # visitor type
         preferred_rides = {
             "child": ["Carousel", "Slide Cars", "Self-Control Planes", "Spiral Rides"],
             "adult": ["Ferris Wheel", "Race Cars", "Flying Tower", "Spiral Rides"]
         }
         ride_name = random.choice(preferred_rides[visitor_type])
-        ride = rides[ride_name]
+        ride = rides[ride_name] # calls ride object
 
-        priority = 'VIP' if random.random() < 0.1 else 'regular'
-        env.process(visitor(env, visitor_id, ride, priority, visitor_type))
+        priority = 'VIP' if random.random() < 0.1 else 'regular' # 10% chance of vip
+        env.process(visitor(env, visitor_id, ride, priority, visitor_type)) # start process
         visitor_id += 1
 
-def visitor(env, visitor_id, ride, priority='regular', visitor_type='child'):
+def visitor(env, visitor_id, ride, priority='regular', visitor_type='child'): # sim visitor behaviour
     arrival_time = env.now
     
-    while ride.broken:
-        yield env.timeout(1)
+    while ride.broken: # wait if ride is broken
+        ride.dropped_visitors += 1
+        return
     
-    with ride.resource.request(priority=VISITOR_PRIORITY[priority]) as request:
+    with ride.resource.request(priority=VISITOR_PRIORITY[priority]) as request: # request access to ride
         yield request
         ride.monitor_utilization()
 
@@ -163,7 +164,7 @@ def visitor(env, visitor_id, ride, priority='regular', visitor_type='child'):
 
         ride.monitor_utilization()
 
-        ride.log_event(visitor_id, arrival_time, wait_time, service_time, ride_start_time, ride_end_time, visitor_type)
+        ride.log_event(visitor_id, arrival_time, wait_time, service_time, ride_start_time, ride_end_time, visitor_type, priority)
 
 def visualize_summary(rides, sim_time):
     ride_names = list(rides.keys())
@@ -261,22 +262,25 @@ def simulate():
     env.process(visitor_generator(env, rides, VISITOR_ARRIVAL_MEAN))
     env.run(until=SIMULATION_TIME)
     total_visitors = sum(r.total_visitors for r in rides.values())
+    dropped_visitors = sum(r.dropped_visitors for r in rides.values())
     completed = sum(r.completed_rides for r in rides.values())
     avg_wait = sum(r.total_wait_time for r in rides.values()) / completed if completed else 0
+    total = total_visitors + dropped_visitors
 
     print("\n♡ Logs ♡\n")
     combined_logs = []
     for logs in event_logs_per_ride.values():
         combined_logs.extend(logs)
     random.shuffle(combined_logs)
-    headers = ["Minute", "Visitor Type", "Visitor ID", "Ride", "Arrival Time", "Service Time",
+    headers = ["Minute", "Visitor ID", "Visitor Type", "Priority", "Ride", "Arrival Time", "Service Time",
                "Ride Start Time", "Ride End Time", "Wait Time", "Queue Length", "Riders", "Status"]
 
     print(tabulate(combined_logs[:50], headers=headers, tablefmt="fancy_grid"))
 
     print("\n♡ Simulation Summary ♡")
     print(f"Simulation Time: {SIMULATION_TIME} minutes")
-    print(f"Total Visitors: {total_visitors}")
+    print(f"Total Visitors: {total}")
+    print(f"Dropped Visitors: {dropped_visitors}")
     print(f"Completed Visitors: {completed}")
     print(f"Average Wait Time: {format_time(avg_wait)}")
 
