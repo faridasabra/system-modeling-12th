@@ -1,241 +1,310 @@
+import simpy
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import deque, defaultdict
+import pandas as pd
+import seaborn as sns
 from tabulate import tabulate
+from collections import defaultdict
 
-SIMULATION_TIME = 8 * 60
-VISITOR_ARRIVAL_MEAN = 2
+SIMULATION_TIME = 10 * 60
+VISITOR_ARRIVAL_MEAN = 0.5
 RIDE_NAMES = ["Carousel", "Slide Cars", "Race Cars", "Ferris Wheel",
               "Self-Control Planes", "Spiral Rides", "Flying Tower"]
 RIDE_CAPACITY = {
-    "Carousel": 10,
-    "Slide Cars": 8,
-    "Race Cars": 5,
-    "Ferris Wheel": 20,
-    "Self-Control Planes": 6,
-    "Spiral Rides": 7,
-    "Flying Tower": 10,
+    "Carousel": 2,
+    "Slide Cars": 5,
+    "Race Cars": 2,
+    "Ferris Wheel": 10,
+    "Self-Control Planes": 5,
+    "Spiral Rides": 10,
+    "Flying Tower": 3,
 }
 RIDE_SERVICE_TIME = {
-    "Carousel": lambda: int(np.random.normal(5, 1)),
+    "Carousel": lambda: max(3, int(np.random.normal(10, 2))),
     "Slide Cars": lambda: int(np.random.triangular(3, 5, 8)),
-    "Race Cars": lambda: int(np.random.normal(7, 2)),
-    "Ferris Wheel": lambda: int(np.random.normal(10, 3)),
+    "Race Cars": lambda: max(3, int(np.random.normal(12, 3))),
+    "Ferris Wheel": lambda: max(1, int(np.random.normal(10, 3))),
     "Self-Control Planes": lambda: int(np.random.triangular(4, 6, 9)),
-    "Spiral Rides": lambda: int(np.random.normal(6, 1)),
-    "Flying Tower": lambda: int(np.random.triangular(5, 8, 12)),
+    "Spiral Rides": lambda: max(1, int(np.random.normal(6, 1))),
+    "Flying Tower": lambda: int(np.random.triangular(10, 15, 20)),
 }
-RIDE_FAILURE_PROB = 0.01
+RIDE_FAILURE_PROB = {
+    "Carousel": 0.03,
+    "Slide Cars": 0.01,
+    "Race Cars": 0.03,
+    "Ferris Wheel": 0.01,
+    "Self-Control Planes": 0.01,
+    "Spiral Rides": 0.01,
+    "Flying Tower": 0.03,
+}
 RIDE_REPAIR_TIME = lambda: int(np.random.weibull(1.5) * 10)
+VISITOR_PRIORITY = {
+    "VIP": 0,
+    "regular": 1,
+}
 
 event_logs_per_ride = {name: [] for name in RIDE_NAMES}
 
+def format_time(t):
+    total_seconds = int(t * 60)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
 class Ride:
-    def __init__(self, name, capacity):
+    def __init__(self, env, name, capacity):
+        self.env = env
         self.name = name
         self.capacity = capacity
-        self.queue = deque()
-        self.active_riders = []
-        self.status = "idle"
-        self.repair_time_remaining = 0
-        self.utilization = 0
-        self.completed_rides = 0
-        self.total_queue_length = 0
-        self.total_wait_time = 0
+        self.resource = simpy.PriorityResource(env, capacity)
+        self.broken = False
         self.total_visitors = 0
-        self.state_durations = {
-            'idle': 0,
-            'busy': 0,
-            'broken': 0
+        self.dropped_visitors = 0
+        self.total_wait_time = 0
+        self.utilization_time = 0
+        self.total_queue_time = 0
+        self.queue_lengths = []
+        self.failures = 0
+        self.completed_rides = 0
+        self.state_durations = defaultdict(int)
+        self.last_event_time = 0
+        self.utilization_log = []
+        self.queue_log = []
+        self.idle_time = 0
+        self.last_busy_time = 0
+        self.env.process(self.breakdown_monitor())
+        self.env.process(self.log_time_series())
+
+    def monitor_utilization(self):
+        now = self.env.now # gets current sim time
+        duration = now - self.last_event_time # calc how much time passed since last state change
+        state = 'broken' if self.broken else ('busy' if self.resource.count else 'idle')
+        self.state_durations[state] += duration
+        if state == 'idle':
+            self.idle_time += duration
+        elif state == 'broken':
+            self.last_busy_time = now
+        self.last_event_time = now
+
+    def log_event(self, visitor_id, arrival_time, wait_time, service_time, ride_start_time, ride_end_time, visitor_type):
+        if len(event_logs_per_ride[self.name]) < 20:
+            event_logs_per_ride[self.name].append([
+                format_time(self.env.now),
+                visitor_type,
+                visitor_id,
+                self.name,
+                format_time(arrival_time),
+                f"{service_time} min",
+                format_time(ride_start_time),
+                format_time(ride_end_time),
+                format_time(wait_time),
+                len(self.resource.queue),
+                self.resource.count,
+                "broken" if self.broken else "busy" if self.resource.count else "idle"
+            ])
+
+    def breakdown_monitor(self):
+        while True:
+            if not self.broken and random.random() < RIDE_FAILURE_PROB[self.name]:
+                self.broken = True
+                self.failures += 1
+                self.monitor_utilization()
+                yield self.env.timeout(RIDE_REPAIR_TIME())
+                self.monitor_utilization()
+                self.broken = False
+            yield self.env.timeout(1)
+
+    def log_time_series(self):
+        while True:
+            self.utilization_log.append((self.env.now, self.resource.count))
+            self.queue_log.append((self.env.now, len(self.resource.queue)))
+            yield self.env.timeout(5)
+
+def visitor_generator(env, rides, arrival_mean):
+    visitor_id = 0
+    while True:
+        yield env.timeout(np.random.exponential(arrival_mean))
+        visitor_type = random.choices(["child", "adult"], weights=[0.5, 0.5])[0]
+        preferred_rides = {
+            "child": ["Carousel", "Slide Cars", "Self-Control Planes", "Spiral Rides"],
+            "adult": ["Ferris Wheel", "Race Cars", "Flying Tower", "Spiral Rides"]
         }
+        ride_name = random.choice(preferred_rides[visitor_type])
+        ride = rides[ride_name]
 
-    def update(self, minute):
-        if self.status == "broken":
-            self.repair_time_remaining -= 1
-            if self.repair_time_remaining <= 0:
-                self.status = "idle"
-        else:
-            if random.random() < RIDE_FAILURE_PROB:
-                self.status = "broken"
-                self.repair_time_remaining = RIDE_REPAIR_TIME()
-                self.active_riders.clear()
-            else:
-                for rider in list(self.active_riders):
-                    rider['remaining'] -= 1
-                    if rider['remaining'] <= 0:
-                        self.active_riders.remove(rider)
+        priority = 'VIP' if random.random() < 0.1 else 'regular'
+        env.process(visitor(env, visitor_id, ride, priority, visitor_type))
+        visitor_id += 1
 
-                while len(self.active_riders) < self.capacity and self.queue:
-                    visitor = self.queue.popleft()
-                    wait_time = minute - visitor['arrival']
-                    service_time = RIDE_SERVICE_TIME[self.name]()
-                    visitor['waited'] = wait_time
-                    self.total_wait_time += wait_time
-                    self.total_visitors += 1
-                    self.active_riders.append({
-                        'id': visitor['id'],
-                        'remaining': service_time
-                    })
-                    self.completed_rides += 1
+def visitor(env, visitor_id, ride, priority='regular', visitor_type='child'):
+    arrival_time = env.now
+    
+    while ride.broken:
+        yield env.timeout(1)
+    
+    with ride.resource.request(priority=VISITOR_PRIORITY[priority]) as request:
+        yield request
+        ride.monitor_utilization()
 
-                    if len(event_logs_per_ride[self.name]) < 20:
-                        event_logs_per_ride[self.name].append([
-                            minute,
-                            visitor['id'],
-                            self.name,
-                            visitor['arrival'],
-                            service_time,
-                            wait_time,
-                            len(self.queue),
-                            len(self.active_riders),
-                            self.status
-                        ])
+        wait_time = env.now - arrival_time
+        service_time = RIDE_SERVICE_TIME[ride.name]()
+        
+        ride.total_visitors += 1
+        ride.total_wait_time += wait_time
+        ride.utilization_time += service_time
+        ride.queue_lengths.append(len(ride.resource.queue))
+        ride.completed_rides += 1
 
-        if self.status != "broken":
-            self.status = "busy" if self.active_riders else "idle"
+        ride_start_time = env.now
+        yield env.timeout(service_time)
+        ride_end_time = env.now
 
-        self.state_durations[self.status] += 1
-        self.utilization += len(self.active_riders)
-        self.total_queue_length += len(self.queue)
+        ride.monitor_utilization()
 
-def generate_arrivals(max_time):
-    arrivals = []
-    time = 0
-    id_counter = 0
-    while time < max_time:
-        interarrival = int(np.random.exponential(VISITOR_ARRIVAL_MEAN))
-        time += interarrival
-        if time >= max_time:
-            break
-        ride = random.choice(RIDE_NAMES)
-        arrivals.append({'id': id_counter, 'arrival': time, 'ride': ride})
-        id_counter += 1
-    return arrivals
+        ride.log_event(visitor_id, arrival_time, wait_time, service_time, ride_start_time, ride_end_time, visitor_type)
 
-def visualize_summary(rides, sim_time, completed_visitors, total_visitors):
+def visualize_summary(rides, sim_time):
     ride_names = list(rides.keys())
+    
     utilization = []
     queue_lengths = []
     wait_times = []
-
+    downtimes = []
     for ride in rides.values():
         max_util = ride.capacity * sim_time
-        utilization.append((ride.utilization / max_util) * 100)
-        queue_lengths.append(ride.total_queue_length / sim_time)
-        avg_wait = (ride.total_wait_time / ride.total_visitors) if ride.total_visitors else 0
+        utilization.append((ride.utilization_time / max_util) * 100)
+        avg_q_len = np.mean(ride.queue_lengths) if ride.queue_lengths else 0
+        queue_lengths.append(avg_q_len)
+        avg_wait = ride.total_wait_time / ride.total_visitors if ride.total_visitors else 0
         wait_times.append(avg_wait)
+        downtimes.append(ride.state_durations['broken'] / 60)
+    
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    colors = plt.cm.Pastel1.colors
+    
+    axs[0,0].bar(ride_names, utilization, color=colors)
+    axs[0,0].set_title("Ride Utilization", fontsize=10)
+    axs[0,0].set_ylabel("Utilization (%)")
+    axs[0,0].tick_params(axis='x', rotation=45)
+    
+    axs[0,1].bar(ride_names, wait_times, color=colors)
+    axs[0,1].set_title("Average Wait Time", fontsize=10)
+    axs[0,1].set_ylabel("Minutes")
+    axs[0,1].tick_params(axis='x', rotation=45)
+    
+    axs[1,0].bar(ride_names, queue_lengths, color=colors)
+    axs[1,0].set_title("Average Queue Length", fontsize=10)
+    axs[1,0].set_ylabel("People")
+    axs[1,0].tick_params(axis='x', rotation=45)
+    
+    axs[1,1].bar(ride_names, downtimes, color=colors)
+    axs[1,1].set_title("Total Downtime", fontsize=10)
+    axs[1,1].set_ylabel("Hours")
+    axs[1,1].tick_params(axis='x', rotation=45)
+    
+    plt.suptitle("Theme Park Performance Summary", fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig("performance_summary.png")
 
-    throughput_percent = (completed_visitors / total_visitors) * 100
-
-    pastel_pink = "#ffb6c1"
-    pastel_purple = "#dda0dd"
-    pastel_peach = "#ffe4e1"
-
-    plt.rcParams.update({
-        "axes.facecolor": "#fff0f5",
-        "figure.facecolor": "#fff0f5",
-        "axes.titleweight": "bold",
-        "axes.titlesize": 14,
-        "axes.labelsize": 12
-    })
-
-    fig, axs = plt.subplots(3, 1, figsize=(12, 10))
-
-    axs[0].bar(ride_names, utilization, color=pastel_pink, edgecolor='hotpink')
-    axs[0].set_title("Ride Utilization")
-    axs[0].set_ylabel("Utilization (%)")
-
-    axs[1].bar(ride_names, queue_lengths, color=pastel_purple, edgecolor='mediumorchid')
-    axs[1].set_title("Average Queue Length")
-    axs[1].set_ylabel("People/Minute")
-
-    axs[2].bar(ride_names, wait_times, color=pastel_peach, edgecolor='salmon')
-    axs[2].set_title("Average Wait Time")
-    axs[2].set_ylabel("Minutes")
-    axs[2].set_xlabel("Ride Name")
-
-    for ax in axs:
-        ax.tick_params(axis='x', rotation=15)
-        ax.spines[['top', 'right']].set_visible(False)
-
-    plt.suptitle(f"Theme Park Summary (Throughput: {throughput_percent:.2f}%)", fontsize=18, color='deeppink', weight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("plot.png")
-
-def simulate(sim_time=SIMULATION_TIME, arrival_mean=VISITOR_ARRIVAL_MEAN):
-    rides = {name: Ride(name, RIDE_CAPACITY[name]) for name in RIDE_NAMES}
-    arrivals = generate_arrivals(sim_time)
-    timeline = defaultdict(list)
-    for visitor in arrivals:
-        timeline[visitor['arrival']].append(visitor)
-
-    total_failures = {name: 0 for name in RIDE_NAMES}
-    served_ids = set()
-
-    for minute in range(sim_time):
-        for visitor in timeline[minute]:
-            rides[visitor['ride']].queue.append(visitor)
-
-        for name, ride in rides.items():
-            prev_status = ride.status
-            ride.update(minute)
-            if prev_status != "broken" and ride.status == "broken":
-                total_failures[name] += 1
-
-            served_ids.update(r['id'] for r in ride.active_riders)
-
-    print("\n--- Simulation Summary ---")
-    print(f"Simulation Time: {sim_time} minutes")
-
-    total_visitors = len(arrivals)
-    completed_visitors = sum(ride.completed_rides for ride in rides.values())
-    dropped_visitors = total_visitors - completed_visitors
-    dropped_ids = sorted(set(v['id'] for v in arrivals) - served_ids)
-    total_wait = sum(ride.total_wait_time for ride in rides.values())
-    avg_wait = total_wait / completed_visitors if completed_visitors else 0
-
-    print(f"Total Visitors: {total_visitors}")
-    print(f"Completed Visitors: {completed_visitors}")
-    print(f"Dropped Visitors: {dropped_visitors}")
-    print(f"Average Wait Time: {avg_wait:.2f} minutes")
-
+def plot_time_series(rides, top_n=2):
     bottlenecks = []
     for name, ride in rides.items():
-        max_possible_utilization = ride.capacity * sim_time
-        utilization_percent = (ride.utilization / max_possible_utilization) * 100
-        avg_queue_length = ride.total_queue_length / sim_time
-        avg_wait_time = ride.total_wait_time / ride.total_visitors if ride.total_visitors else 0
-        downtime = ride.state_durations['broken']
-        downtime_percent = (downtime / sim_time) * 100
-
-        bottlenecks.append((name, avg_wait_time, utilization_percent))
-
-        print(f"\n{name}:")
-        print(f"  Capacity: {ride.capacity}")
-        print(f"  Visitors Served: {ride.total_visitors}")
-        print(f"  Utilization: {utilization_percent:.2f}%")
-        print(f"  Failures: {total_failures[name]}")
-        print(f"  Downtime: {downtime} min ({downtime_percent:.2f}%)")
-        print(f"  Avg Queue Length: {avg_queue_length:.2f} people/min")
-        print(f"  Avg Wait Time: {avg_wait_time:.2f} min")
-
+        avg_wait = ride.total_wait_time / ride.total_visitors if ride.total_visitors else 0
+        util_pct = (ride.utilization_time / (ride.capacity * SIMULATION_TIME)) * 100
+        bottlenecks.append((name, avg_wait, util_pct))
     bottlenecks.sort(key=lambda x: (-x[1], -x[2]))
-    print("\n--- Top Bottleneck Rides (By Avg Wait & Utilization) ---")
-    for b in bottlenecks[:2]:
-        print(f"{b[0]} - Avg Wait: {b[1]:.2f} min, Utilization: {b[2]:.2f}%")
+    top_rides = [b[0] for b in bottlenecks[:top_n]]
+    
+    if not top_rides:
+        return
+    
+    fig, axs = plt.subplots(len(top_rides), 2, figsize=(14, 5*len(top_rides)))
+    if len(top_rides) == 1:
+        axs = [axs]
+    
+    for i, ride_name in enumerate(top_rides):
+        ride = rides[ride_name]
+        times_u, util = zip(*ride.utilization_log)
+        times_q, queue = zip(*ride.queue_log)
 
-    print("\n--- Combined Per-Ride Simulation Table (Sorted by Minute) ---\n")
+        axs[i][0].plot(times_u, util, color='#ff69b4')
+        axs[i][0].set_title(f"{ride_name} - Utilization", fontsize=10)
+        axs[i][0].set_ylabel("In Use")
+
+        axs[i][1].plot(times_q, queue, color='#da70d6')
+        axs[i][1].set_title(f"{ride_name} - Queue Length", fontsize=10)
+        axs[i][1].set_ylabel("People")
+    
+    plt.suptitle("Time Series for Top Bottleneck Rides", y=1.02)
+    plt.tight_layout()
+    plt.savefig("bottleneck_rides_timeseries.png")
+
+def plot_downtime_pie(rides):
+    labels = []
+    values = []
+    for name, ride in rides.items():
+        downtime = ride.state_durations['broken']
+        if downtime > 0:
+            labels.append(name)
+            values.append(downtime)
+    plt.figure(figsize=(7, 7))
+    plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=140,
+            colors=plt.cm.Pastel1.colors)
+    plt.title("Proportion of Downtime per Ride", color='hotpink')
+    plt.savefig("downtime_pie.png")
+
+def simulate():
+    env = simpy.Environment()
+    rides = {name: Ride(env, name, RIDE_CAPACITY[name]) for name in RIDE_NAMES}
+    env.process(visitor_generator(env, rides, VISITOR_ARRIVAL_MEAN))
+    env.run(until=SIMULATION_TIME)
+    total_visitors = sum(r.total_visitors for r in rides.values())
+    completed = sum(r.completed_rides for r in rides.values())
+    avg_wait = sum(r.total_wait_time for r in rides.values()) / completed if completed else 0
+
+    print("\n♡ Logs ♡\n")
     combined_logs = []
     for logs in event_logs_per_ride.values():
         combined_logs.extend(logs)
-    combined_logs.sort(key=lambda x: x[1])
-    headers = ["Minute", "Visitor ID", "Ride", "Arrival Time", "Service Time",
-               "Wait Time", "Queue Length", "Riders on Ride", "Ride Status"]
-    print(tabulate(combined_logs, headers=headers, tablefmt="github"))
+    random.shuffle(combined_logs)
+    headers = ["Minute", "Visitor Type", "Visitor ID", "Ride", "Arrival Time", "Service Time",
+               "Ride Start Time", "Ride End Time", "Wait Time", "Queue Length", "Riders", "Status"]
 
-    print(f"\n--- Dropped Visitor IDs (not served): ---\n{dropped_ids}")
+    print(tabulate(combined_logs[:50], headers=headers, tablefmt="fancy_grid"))
 
-    visualize_summary(rides, sim_time, completed_visitors, len(arrivals))
+    print("\n♡ Simulation Summary ♡")
+    print(f"Simulation Time: {SIMULATION_TIME} minutes")
+    print(f"Total Visitors: {total_visitors}")
+    print(f"Completed Visitors: {completed}")
+    print(f"Average Wait Time: {format_time(avg_wait)}")
+
+    bottlenecks = []
+    for name, ride in rides.items():
+        util_pct = (ride.utilization_time / (ride.capacity * SIMULATION_TIME)) * 100
+        avg_q = np.mean(ride.queue_lengths) if ride.queue_lengths else 0
+        avg_wait = ride.total_wait_time / ride.total_visitors if ride.total_visitors else 0
+        down_time = ride.state_durations['broken']
+        down_pct = (down_time / SIMULATION_TIME) * 100
+        bottlenecks.append((name, avg_wait, util_pct))
+        print(f"\n♡ {name} ♡")
+        print(f"  - Capacity: {ride.capacity}")
+        print(f"  - Served: {ride.total_visitors}")
+        print(f"  - Dropped Visitors: {ride.dropped_visitors}")
+        print(f"  - Failures: {ride.failures}")
+        print(f"  - Utilization: {util_pct:.2f}%")
+        print(f"  - Downtime: {format_time(down_time)} ({down_pct:.2f}%)")
+        print(f"  - Avg Queue: {avg_q:.2f}")
+        print(f"  - Avg Wait: {format_time(avg_wait)}")
+
+    bottlenecks.sort(key=lambda x: (-x[1], -x[2]))
+
+    print("\n♡ Top Bottleneck Rides ♡")
+    for b in bottlenecks[:2]:
+        print(f"{b[0]} - Avg Wait: {b[1]:.2f} min, Utilization: {b[2]:.2f}%")
+    visualize_summary(rides, SIMULATION_TIME)
+    plot_time_series(rides)
+    plot_downtime_pie(rides)
 
 simulate()
