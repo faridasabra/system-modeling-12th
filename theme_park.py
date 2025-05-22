@@ -21,8 +21,8 @@ RIDE_CAPACITY = {
     "Flying Tower": 3,
 }
 RIDE_SERVICE_TIME = {
-    "Carousel": lambda: max(3, int(np.random.normal(10, 2))),
-    "Slide Cars": lambda: int(np.random.triangular(3, 5, 8)),
+    "Carousel": lambda: max(3, int(np.random.normal(10, 2))), #  most rides will last between 8 to 12 minutes, the max 3 ensures no ride is shorter than 3 minutes (mean, std)
+    "Slide Cars": lambda: int(np.random.triangular(3, 5, 8)), #  most rides ;ast 5 mins, but could vary between 3 to 8 mins (mean, mode, max)
     "Race Cars": lambda: max(3, int(np.random.normal(12, 3))),
     "Ferris Wheel": lambda: max(1, int(np.random.normal(10, 3))),
     "Self-Control Planes": lambda: int(np.random.triangular(4, 6, 9)),
@@ -76,7 +76,7 @@ class Ride:
         self.env.process(self.breakdown_monitor()) # start breakdown monitoring
         self.env.process(self.log_time_series()) # start time series logging
 
-    def monitor_utilization(self):
+    def monitor_utilization(self): #  track how much time a ride spends in each operational state
         now = self.env.now # gets current sim time
         duration = now - self.last_event_time # calc how much time passed since last state change
         state = 'broken' if self.broken else ('busy' if self.resource.count else 'idle')
@@ -141,16 +141,16 @@ def visitor_generator(env, rides, arrival_mean):
 def visitor(env, visitor_id, ride, priority='regular', visitor_type='child'): # sim visitor behaviour
     arrival_time = env.now
     
-    while ride.broken: # wait if ride is broken
+    while ride.broken: # drop visitors if ride is broken
         ride.dropped_visitors += 1
         return
     
     with ride.resource.request(priority=VISITOR_PRIORITY[priority]) as request: # request access to ride
-        yield request
-        ride.monitor_utilization()
+        yield request # wait
+        ride.monitor_utilization() # log utilization state
 
-        wait_time = env.now - arrival_time
-        service_time = RIDE_SERVICE_TIME[ride.name]()
+        wait_time = env.now - arrival_time # calc wait time
+        service_time = RIDE_SERVICE_TIME[ride.name]() # get service duration
         
         ride.total_visitors += 1
         ride.total_wait_time += wait_time
@@ -159,10 +159,10 @@ def visitor(env, visitor_id, ride, priority='regular', visitor_type='child'): # 
         ride.completed_rides += 1
 
         ride_start_time = env.now
-        yield env.timeout(service_time)
+        yield env.timeout(service_time) # sim ride simulation
         ride_end_time = env.now
 
-        ride.monitor_utilization()
+        ride.monitor_utilization() # update start again
 
         ride.log_event(visitor_id, arrival_time, wait_time, service_time, ride_start_time, ride_end_time, visitor_type, priority)
 
@@ -284,14 +284,15 @@ def simulate():
     print(f"Completed Visitors: {completed}")
     print(f"Average Wait Time: {format_time(avg_wait)}")
 
-    bottlenecks = []
+    bottlenecks = [] # list to stpre bottleneck data for each ride
     for name, ride in rides.items():
-        util_pct = (ride.utilization_time / (ride.capacity * SIMULATION_TIME)) * 100
+        util_pct = (ride.utilization_time / (ride.capacity * SIMULATION_TIME)) * 100 # calc util %
         avg_q = np.mean(ride.queue_lengths) if ride.queue_lengths else 0
         avg_wait = ride.total_wait_time / ride.total_visitors if ride.total_visitors else 0
         down_time = ride.state_durations['broken']
         down_pct = (down_time / SIMULATION_TIME) * 100
-        bottlenecks.append((name, avg_wait, util_pct))
+        bottlenecks.append((name, avg_wait, util_pct)) # store name, avg wait, util for analysis
+
         print(f"\n♡ {name} ♡")
         print(f"  - Capacity: {ride.capacity}")
         print(f"  - Served: {ride.total_visitors}")
